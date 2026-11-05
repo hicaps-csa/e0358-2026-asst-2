@@ -14,14 +14,15 @@ of each matmul.
 
 The problem sizes are drawn from common attention configurations and are
 listed in SIZES. For each size, the outputs of the compiled function are
-validated against a reference (eager by default, or Inductor), and eager,
-Inductor, and the selected backend are benchmarked.
+validated against a reference (eager by default, or Inductor), and the
+baselines (eager, Inductor, TensorRT) and the backend, both without and with
+sibling fusion, are benchmarked.
 
 Usage:
-  python qkv-projection.py                          # Inductor, all sizes.
-  python qkv-projection.py --backend e0358          # E0358 backend.
-  python qkv-projection.py --backend e0358 --fusion off
+  python qkv-projection.py --backend e0358      # All variants, all sizes.
+  python qkv-projection.py --backend e0358 --fusion on --baselines
   python qkv-projection.py --backend e0358 --reference inductor
+  python qkv-projection.py                      # Baselines only.
   python qkv-projection.py --sizes bert-base --iters 0   # Validate only.
 """
 

@@ -3,13 +3,20 @@ Utilities shared by the E0358 Assignment 2 test scripts.
 
 A test script defines a workload (a function to compile, a routine that
 builds its inputs, and the problem sizes to run it at) and defers the rest
-to this module: command-line parsing, resolving the torch.compile backend,
+to this module: command-line parsing, resolving the torch.compile backends,
 validating the compiled outputs against a reference (eager or Inductor),
 and benchmarking with warmup iterations followed by timed steady-state
 iterations.
+
+Every run measures a set of variants: the baselines (eager execution,
+Inductor, and TensorRT through Torch-TensorRT) and the backend under test,
+which for the e0358 backend is run both without and with sibling fusion.
 """
 
 import argparse
+import collections
+import importlib
+import importlib.util
 import os
 import statistics
 import time
@@ -31,26 +38,120 @@ TOLERANCES = {
     torch.bfloat16: dict(rtol=2e-2, atol=5e-2),
 }
 
-# The harness sets this environment variable from --fusion before compiling;
-# the e0358 backend reads it to decide whether to perform sibling fusion.
+# The baselines, in the order they are reported. 'tensorrt' is the backend
+# that Torch-TensorRT (pip install torch-tensorrt) registers with Dynamo.
+BASELINES = ["eager", "inductor", "tensorrt"]
+
+# The modules that register the non-built-in backends with torch._dynamo.
+BACKEND_MODULES = {"e0358": "e0358", "tensorrt": "torch_tensorrt"}
+
+# The harness sets this environment variable to "1" or "0" right before a
+# backend is invoked to compile a graph; the e0358 backend reads it to decide
+# whether to perform sibling fusion.
 FUSION_ENV_VAR = "E0358_SIBLING_FUSION"
+
+# A variant to run: 'backend' is the torch.compile backend ('eager' for eager
+# execution) and 'fusion' is None, or True/False for the e0358 backend with
+# or without sibling fusion.
+Variant = collections.namedtuple("Variant", ["label", "backend", "fusion"])
 
 
 def get_backend(name):
-    """Returns the torch.compile backend to use for 'name'."""
-    if name == "e0358":
-        # The E0358 backend is expected to register itself with Dynamo (e.g.,
-        # via torch._dynamo.register_backend(name="e0358")) when imported.
+    """Makes sure that the torch.compile backend 'name' is registered with
+    Dynamo, importing the module that registers it if needed, and returns
+    'name'."""
+    module = BACKEND_MODULES.get(name)
+    if module and name not in torch._dynamo.list_backends():
         try:
-            import e0358  # noqa: F401
-        except ImportError:
-            pass
-        if "e0358" not in torch._dynamo.list_backends():
+            importlib.import_module(module)
+        except ImportError as err:
             raise SystemExit(
-                "Backend 'e0358' is not registered with torch._dynamo; make "
-                "sure the 'e0358' module is importable and registers it."
-            )
+                f"Backend '{name}' needs the '{module}' module, which could "
+                f"not be imported: {err}"
+            ) from None
+    if name not in torch._dynamo.list_backends():
+        raise SystemExit(
+            f"Backend '{name}' is not registered with torch._dynamo"
+            + (f" by the '{module}' module." if module else ".")
+        )
     return name
+
+
+def tensorrt_options(dtype):
+    """Options for compiling with the 'tensorrt' backend (Torch-TensorRT)."""
+    return {
+        # The default min_block_size of 5 would leave a graph of three
+        # matmuls to PyTorch; require TensorRT to run all of it instead.
+        "min_block_size": 1,
+        "require_full_compilation": True,
+        "enabled_precisions": {dtype},
+        # Use TF32 for float32 matmuls only if PyTorch itself does (by
+        # default it does not: its float32 matmul precision is "highest").
+        "disable_tf32": torch.get_float32_matmul_precision() == "highest",
+    }
+
+
+def with_fusion(name, fusion):
+    """Returns a torch.compile backend that sets FUSION_ENV_VAR to "1"
+    ('fusion' True) or "0" and then invokes the backend 'name' to compile
+    the graph.
+
+    Every call returns a distinct callable, so that a function compiled with
+    both the fusion and the no-fusion backend is compiled twice, rather than
+    the second reusing the code Dynamo compiled for the first.
+    """
+    base = torch._dynamo.lookup_backend(name)
+
+    def backend(gm, example_inputs, **kwargs):
+        os.environ[FUSION_ENV_VAR] = "1" if fusion else "0"
+        return base(gm, example_inputs, **kwargs)
+
+    backend.__name__ = f"{name}_{'fusion' if fusion else 'no_fusion'}"
+    return backend
+
+
+def compile_variant(fn, variant, dtype):
+    """Returns 'fn' compiled as 'variant' ('fn' itself for eager)."""
+    if variant.backend == "eager":
+        return fn
+    backend = get_backend(variant.backend)
+    options = None
+    if variant.backend == "tensorrt":
+        options = tensorrt_options(dtype)
+    if variant.fusion is not None:
+        backend = with_fusion(backend, variant.fusion)
+    return torch.compile(fn, backend=backend, dynamic=False, options=options)
+
+
+def variants(args):
+    """Returns the variants to run, in the order they are reported: the
+    selected baselines (always including the reference), followed by the
+    backend under test under each selected sibling fusion setting."""
+    result = []
+    for name in BASELINES:
+        if name not in args.baselines and name not in (
+            args.backend,
+            args.reference,
+        ):
+            continue
+        module = BACKEND_MODULES.get(name)
+        if (
+            name != args.backend
+            and module
+            and importlib.util.find_spec(module) is None
+        ):
+            print(
+                f"warning: skipping the {name} baseline: the '{module}' "
+                f"module is not installed"
+            )
+            continue
+        result.append(Variant(name, name, None))
+    if args.backend not in BASELINES:
+        settings = {"off": [False], "on": [True], "both": [False, True]}
+        for fusion in settings[args.fusion]:
+            label = f"{args.backend} ({'fusion' if fusion else 'no fusion'})"
+            result.append(Variant(label, args.backend, fusion))
+    return result
 
 
 def parse_args(description, sizes):
@@ -60,7 +161,8 @@ def parse_args(description, sizes):
     parser.add_argument(
         "--backend",
         default="inductor",
-        help="torch.compile backend to test: inductor (default) or e0358",
+        help="backend to validate and benchmark: inductor (default), "
+        "tensorrt, or e0358",
     )
     parser.add_argument(
         "--reference",
@@ -88,10 +190,20 @@ def parse_args(description, sizes):
         help=f"problem sizes to run (default: all): {', '.join(sizes)}",
     )
     parser.add_argument(
+        "--baselines",
+        nargs="*",
+        default=BASELINES,
+        choices=BASELINES,
+        metavar="NAME",
+        help="baselines to benchmark alongside the backend (default: "
+        f"{' '.join(BASELINES)}; give no names to benchmark none)",
+    )
+    parser.add_argument(
         "--fusion",
-        default="on",
-        choices=["on", "off"],
-        help=f"sets {FUSION_ENV_VAR}=1/0 for the e0358 backend (default: on)",
+        default="both",
+        choices=["on", "off", "both"],
+        help="sibling fusion setting(s) to run the e0358 backend with, i.e., "
+        f"the value(s) of {FUSION_ENV_VAR} (default: both)",
     )
     parser.add_argument(
         "--warmup",
@@ -110,11 +222,6 @@ def parse_args(description, sizes):
         default="median",
         choices=["median", "mean"],
         help="statistic of the timed iterations to report (default: median)",
-    )
-    parser.add_argument(
-        "--no-inductor",
-        action="store_true",
-        help="do not benchmark Inductor (unless it is the backend/reference)",
     )
     return parser.parse_args()
 
@@ -171,9 +278,10 @@ def summarize(times, stat):
     return statistics.fmean(times)
 
 
-def print_table(rows, variants, args, flops):
-    """Prints the benchmark results. 'rows' is a list of (name, size, times)
-    with 'times' mapping each variant to its time in ms."""
+def print_table(plan, names, sizes, times, args, flops):
+    """Prints the benchmark results: one row per variant in 'plan' and one
+    column per problem size in 'names'. 'times' maps a variant label and a
+    size name to the time in ms."""
     print()
     print(
         f"{args.stat} of {args.iters} iterations after {args.warmup} warmup "
@@ -181,25 +289,30 @@ def print_table(rows, variants, args, flops):
         + (" (TFLOP/s in parentheses)" if flops else "")
         + "."
     )
-    width = max(len(v) for v in variants) + 10
-    header = f"{'size':<12} {'N':>6} {'d_model':>8} {'d':>6}"
-    header += "".join(f"{v:>{width}}" for v in variants)
-    print(header)
-    print("-" * len(header))
-    for name, size, times in rows:
-        line = f"{name:<12} {size.N:>6} {size.d_model:>8} {size.d:>6}"
-        for v in variants:
-            cell = f"{times[v]:.3f}"
+    dims = {name: "x".join(str(d) for d in sizes[name]) for name in names}
+    fields = " x ".join(getattr(sizes[names[0]], "_fields", ["size"]))
+    label_w = max(max(len(v.label) for v in plan), len(fields))
+    col_w = max(max(len(s) for s in [*names, *dims.values()]), 15) + 2
+    print(f"{'':<{label_w}}" + "".join(f"{n:>{col_w}}" for n in names))
+    print(
+        f"{fields:<{label_w}}" + "".join(f"{dims[n]:>{col_w}}" for n in names)
+    )
+    print("-" * (label_w + col_w * len(names)))
+    for v in plan:
+        line = f"{v.label:<{label_w}}"
+        for name in names:
+            t = times[v.label][name]
+            cell = f"{t:.3f}"
             if flops:
-                cell += f" ({flops(size) / times[v] / 1e9:.1f})"
-            line += f"{cell:>{width}}"
+                cell += f" ({flops(sizes[name]) / t / 1e9:.1f})"
+            line += f"{cell:>{col_w}}"
         print(line)
 
 
 def run(fn, make_inputs, sizes, args, flops=None):
     """For each selected problem size: builds inputs, validates 'fn' compiled
-    with args.backend against the reference, and benchmarks eager execution,
-    Inductor, and the backend.
+    with args.backend against the reference, and benchmarks every variant
+    (the baselines and the backend, without and with sibling fusion).
 
     'make_inputs(size, device, dtype)' returns the tuple of arguments to call
     'fn' with, and 'fn' returns a tuple of tensors. 'flops(size)', if given,
@@ -207,25 +320,18 @@ def run(fn, make_inputs, sizes, args, flops=None):
     report the achieved TFLOP/s.
     """
     dtype = DTYPES[args.dtype]
-    os.environ[FUSION_ENV_VAR] = "1" if args.fusion == "on" else "0"
-    backend = get_backend(args.backend)
+    plan = variants(args)
+    for v in plan:
+        if v.backend != "eager":
+            get_backend(v.backend)
     print(
         f"backend={args.backend} reference={args.reference} "
-        f"fusion={args.fusion} device={args.device} dtype={args.dtype}"
+        f"device={args.device} dtype={args.dtype}"
     )
+    print("variants: " + ", ".join(v.label for v in plan))
 
-    # The variants to benchmark, in column order.
-    variants = ["eager"]
-    if (
-        not args.no_inductor
-        or args.backend == "inductor"
-        or args.reference == "inductor"
-    ):
-        variants.append("inductor")
-    if args.backend != "inductor":
-        variants.append(args.backend)
-
-    rows, failed = [], []
+    times = {v.label: {} for v in plan}
+    failed = []
     for name in args.sizes:
         size = sizes[name]
         inputs = make_inputs(size, args.device, dtype)
@@ -234,37 +340,38 @@ def run(fn, make_inputs, sizes, args, flops=None):
         # size is compiled on its own and not through a graph specialized
         # (or made dynamic) for a previous one.
         torch._dynamo.reset()
-        fns = {"eager": fn}
-        for v in variants[1:]:
-            fns[v] = torch.compile(fn, backend=get_backend(v), dynamic=False)
-        compiled = fns[args.backend]
+        fns = {v.label: compile_variant(fn, v, dtype) for v in plan}
 
         expected = fns[args.reference](*inputs)
-        actual = compiled(*inputs)
-        ok, max_err, message = check(actual, expected, dtype)
-        print(
-            f"[{args.backend}/{args.device}] {name}: "
-            f"{'PASSED' if ok else 'FAILED'} vs {args.reference} "
-            f"({len(expected)} outputs of shape {tuple(expected[0].shape)}, "
-            f"max abs err {max_err:.3e})"
-        )
-        if not ok:
-            print(f"  {message}")
-            failed.append(name)
+        for v in plan:
+            if v.backend != args.backend:
+                continue
+            actual = fns[v.label](*inputs)
+            ok, max_err, message = check(actual, expected, dtype)
+            print(
+                f"[{v.label}/{args.device}] {name}: "
+                f"{'PASSED' if ok else 'FAILED'} vs {args.reference} "
+                f"({len(expected)} outputs of shape "
+                f"{tuple(expected[0].shape)}, max abs err {max_err:.3e})"
+            )
+            if not ok:
+                print(f"  {message}")
+                failed.append(f"{v.label} at {name}")
 
         if args.iters > 0:
-            times = {
-                v: summarize(
+            for v in plan:
+                times[v.label][name] = summarize(
                     timeit(
-                        fns[v], inputs, args.device, args.warmup, args.iters
+                        fns[v.label],
+                        inputs,
+                        args.device,
+                        args.warmup,
+                        args.iters,
                     ),
                     args.stat,
                 )
-                for v in variants
-            }
-            rows.append((name, size, times))
 
-    if rows:
-        print_table(rows, variants, args, flops)
+    if args.iters > 0:
+        print_table(plan, args.sizes, sizes, times, args, flops)
     if failed:
         raise SystemExit(f"FAILED: {', '.join(failed)}")
